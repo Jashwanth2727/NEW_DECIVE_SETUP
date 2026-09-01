@@ -1,0 +1,13 @@
+[Unit]
+Description=O-Health Kiosk Hardware Shutdown Button
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /home/rpi6/Kiosk/shutdown_button.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

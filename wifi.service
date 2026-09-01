@@ -1,0 +1,15 @@
+[Unit]
+Description=O-Health WiFi Auto Connection
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/rpi13/Kiosk
+ExecStart=/usr/bin/python3 -u /home/rpi13/Kiosk/wifi_autoconnect.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
