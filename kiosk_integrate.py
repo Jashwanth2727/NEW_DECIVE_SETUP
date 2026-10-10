@@ -15,9 +15,14 @@ from pathlib import Path
 
 from bleak import BleakClient, BleakScanner
 from bleak.args.bluez import BlueZNotifyArgs
+import board
+import busio
+import neopixel_spi as neopixel
 
 try:
-    from rpi_ws281x import PixelStrip, ws
+    import board
+    import busio
+    import neopixel_spi as neopixel
     HAS_LEDS = True
 except ImportError:
     HAS_LEDS = False
@@ -36,11 +41,11 @@ STATUS_URL           = "https://prod.o-health.in/api/v2/vitals/updateStatus"
 KIOSK_ID             = socket.gethostname()
 SPOOL_DIR            = Path.home() / "vitals_spool"
 VIDEO_BASE_DIR       = Path.home() / "videos"
-ALT_VIDEO_ROOT       = Path("/home/rpi19/VIDEOS")
+ALT_VIDEO_ROOT       = Path("/home/rpi24/VIDEOS")
 LOG_DIR              = Path.home() / "vitals_logs"
 CONSOLE_LOG_PATH     = LOG_DIR / "vitals_kiosk_console.log"
 SESSION_CSV_PATH     = LOG_DIR / "vitals_kiosk_sessions.csv"
-DOWNLOADS_DIR        = Path("/home/rpi19/Downloads")
+DOWNLOADS_DIR        = Path("/home/rpi24/Downloads")
 DOWNLOADS_LOG_PATH   = DOWNLOADS_DIR / "logsuser.txt"
 DOWNLOADS_CSV_PATH   = DOWNLOADS_DIR / "logs.csv"
 
@@ -63,12 +68,12 @@ LOCKOUT_SECS                 = 180
 POST_PRIMARY_FALLBACK_SCAN_SECS = 10
 BLE_DEBUG_LOG                = False
 
-BP_ALLOWED_MAC   = "FF:FF:11:7F:C1:77"
+BP_ALLOWED_MAC   = "FF:FF:11:7F:CD:7C"
 BP_NAME_HINTS    = ["JPD", "BPM", "TRACKY"]
 BP_NOTIFY        = "0000fff1-0000-1000-8000-00805f9b34fb"
 NOTIFY_ARGS      = BlueZNotifyArgs(use_start_notify=True)
 
-SPO2_ALLOWED_MAC   = "1E:20:0B:01:8B:40"
+SPO2_ALLOWED_MAC   = "1E:20:0B:00:04:A7"
 SPO2_NAME_HINTS    = ["OXIMETER", "MY OXIMETER"]
 SPO2_NOTIFY        = "cdeacb81-5235-4c07-8846-93a37ee6b86d"
 SPO2_STABLE_COUNT  = 3
@@ -86,7 +91,7 @@ NULL_TEMP = {
 
 TEMP_SERVICE_UUID        = "0000fff0-0000-1000-8000-00805f9b34fb"
 TEMP_NOTIFY_UUID         = "0000fff3-0000-1000-8000-00805f9b34fb"
-TEMP_ALLOWED_MAC         = "FF:FF:11:70:74:CB"
+TEMP_ALLOWED_MAC         = "FF:FF:11:70:74:EE"
 TEMP_NAME_HINTS          = ["THERMOMETER", "MY THERMOMETER"]
 TEMP_BLE_CONNECT_TIMEOUT = 60
 TEMP_BLE_MEASURE_TIMEOUT = 60
@@ -294,20 +299,20 @@ LED_FREQ_HZ    = 800000
 LED_INVERT     = False
 LED_BRIGHTNESS = 128
 
-# Strip A — GPIO 18 (DMA 5): LOGO + GLUC
+# Strip A — GPIO 10 (DMA 5): LOGO + GLUC
 LED_COUNT_A    = 4
-LED_PIN_A      = 18
+LED_PIN_A      = 10
 LED_DMA_A      = 5
 LED_LOGO       = [0, 1]
 LED_GLUC       = [2, 3]
 
-# Strip B — GPIO 10 (DMA 8, SPI): SPO2 + MIC + BP
+# Strip B — SPI1 GPIO 20: SPO2 + MIC + BP
 LED_COUNT_B    = 6
-LED_PIN_B      = 10
+LED_PIN_B      = 20
 LED_DMA_B      = 8
-LED_SPO2       = [0, 1]
+LED_BP         = [0, 1]
 LED_MIC        = [2, 3]
-LED_BP         = [4, 5]
+LED_SPO2       = [4, 5]
 
 def _c(r, g, b):
     return (r << 16) | (g << 8) | b
@@ -330,98 +335,122 @@ class LEDState(Enum):
 
 class LEDController:
     def __init__(self):
-        self.pixels_a       = None   # GPIO 18 — LOGO + GLUC
-        self.pixels_b       = None   # GPIO 10 — SPO2 + MIC + BP
-        self.state          = LEDState.OFF
+        self.pixels_a = None
+        self.pixels_b = None
+        self.state = LEDState.OFF
         self._state_started = time.monotonic()
-        self._stop          = False
-        self._bp_active     = False
-        self._spo2_active   = False
-        self._spo2_in_wait  = False
-        self._gluc_active   = False
+        self._stop = False
+        self._bp_active = False
+        self._spo2_active = False
+        self._spo2_in_wait = False
+        self._gluc_active = False
+
         if not HAS_LEDS:
             return
+
         try:
-            self.pixels_a = PixelStrip(
-                LED_COUNT_A, LED_PIN_A, LED_FREQ_HZ, LED_DMA_A,
-                LED_INVERT, LED_BRIGHTNESS, 0, ws.WS2811_STRIP_GRB
+            self.spi0 = board.SPI()
+            self.spi1 = busio.SPI(
+                clock=board.D21,
+                MOSI=board.D20,
+                MISO=board.D19
             )
-            self.pixels_b = PixelStrip(
-                LED_COUNT_B, LED_PIN_B, LED_FREQ_HZ, LED_DMA_B,
-                LED_INVERT, LED_BRIGHTNESS, 0, ws.WS2811_STRIP_GRB
+
+            self.pixels_a = neopixel.NeoPixel_SPI(
+                spi=self.spi0,
+                n=LED_COUNT_A,
+                pixel_order=neopixel.GRB,
+                brightness=LED_BRIGHTNESS / 255.0,
+                auto_write=False
             )
-            self.pixels_a.begin()
-            self.pixels_b.begin()
-            # FIX: explicitly zero + show BOTH strips before touching LOGO.
-            # Previously only strip A got a guaranteed .show() here; strip B's
-            # WS281x DMA buffer could sit un-flushed (often reads back as
-            # solid white / garbage on some Pi + DMA-channel combos) until
-            # the async render loop kicked in.
+
+            self.pixels_b = neopixel.NeoPixel_SPI(
+                spi=self.spi1,
+                n=LED_COUNT_B,
+                pixel_order=neopixel.GRB,
+                brightness=LED_BRIGHTNESS / 255.0,
+                auto_write=False
+            )
+
             self._all_off()
             self._set_pixels_a(LED_LOGO, WHITE)
-            self._show()   # FIX: show() on BOTH strips, not just pixels_a
+            self._show()
+
+            print("  [LED] SPI0 GPIO10 initialized")
+            print("  [LED] SPI1 GPIO20 initialized")
+
         except Exception as e:
             print(f"  [warn] LED init failed: {type(e).__name__}: {e}")
             self.pixels_a = None
             self.pixels_b = None
 
+    @staticmethod
+    def _rgb(color):
+        return (
+            (color >> 16) & 0xFF,
+            (color >> 8) & 0xFF,
+            color & 0xFF
+        )
+
     def _all_off(self):
         if self.pixels_a:
-            for i in range(self.pixels_a.numPixels()):
-                self.pixels_a.setPixelColor(i, OFF)
+            self.pixels_a.fill((0, 0, 0))
             self.pixels_a.show()
+
         if self.pixels_b:
-            for i in range(self.pixels_b.numPixels()):
-                self.pixels_b.setPixelColor(i, OFF)
+            self.pixels_b.fill((0, 0, 0))
             self.pixels_b.show()
 
     def _set_pixels_a(self, leds, color):
         if not self.pixels_a:
             return
+
+        rgb = self._rgb(color)
         for i in leds:
-            self.pixels_a.setPixelColor(i, color)
+            self.pixels_a[i] = rgb
 
     def _set_pixels_b(self, leds, color):
         if not self.pixels_b:
             return
-        for i in leds:
-            self.pixels_b.setPixelColor(i, color)
 
-    def _set_pixels(self, leds, color):
-        # Routes to correct strip based on which zone is requested
-        # Strip A: LED_LOGO, LED_GLUC
-        # Strip B: LED_SPO2, LED_MIC, LED_BP
-        if leds is LED_LOGO or leds is LED_GLUC or leds == LED_LOGO or leds == LED_GLUC:
-            self._set_pixels_a(leds, color)
-        else:
-            self._set_pixels_b(leds, color)
+        rgb = self._rgb(color)
+        for i in leds:
+            self.pixels_b[i] = rgb
 
     def _show(self):
         if self.pixels_a:
             self.pixels_a.show()
+
         if self.pixels_b:
             self.pixels_b.show()
 
     @staticmethod
     def _scale(color, factor):
         r = (color >> 16) & 0xFF
-        g = (color >> 8)  & 0xFF
-        b =  color        & 0xFF
+        g = (color >> 8) & 0xFF
+        b = color & 0xFF
         return _c(int(r * factor), int(g * factor), int(b * factor))
 
     @staticmethod
     def _breath_factor(elapsed):
-        cycle_len = 2 * (BREATH_FADE_STEPS * BREATH_FADE_DELAY) + 2 * BREATH_HOLD_SECS
+        cycle_len = (
+            2 * (BREATH_FADE_STEPS * BREATH_FADE_DELAY)
+            + 2 * BREATH_HOLD_SECS
+        )
         t = elapsed % cycle_len
         fade_dur = BREATH_FADE_STEPS * BREATH_FADE_DELAY
+
         if t < fade_dur:
             return t / fade_dur
+
         t -= fade_dur
         if t < BREATH_HOLD_SECS:
             return 1.0
+
         t -= BREATH_HOLD_SECS
         if t < fade_dur:
             return 1.0 - (t / fade_dur)
+
         return 0.0
 
     def set_state(self, new_state: LEDState):
@@ -429,74 +458,75 @@ class LEDController:
             print(f"  [LED] {self.state.value} -> {new_state.value}")
             self.state = new_state
             self._state_started = time.monotonic()
-            if new_state in (LEDState.OFF, LEDState.ERROR, LEDState.POST_FLOW):
+
+            if new_state in (
+                LEDState.OFF,
+                LEDState.ERROR,
+                LEDState.POST_FLOW
+            ):
                 self._bp_active = False
                 self._spo2_active = False
                 self._gluc_active = False
-            if new_state in (LEDState.CAPTURE, LEDState.POST_FLOW, LEDState.OFF, LEDState.ERROR):
+
+            if new_state in (
+                LEDState.CAPTURE,
+                LEDState.POST_FLOW,
+                LEDState.OFF,
+                LEDState.ERROR
+            ):
                 self._spo2_in_wait = False
 
     def set_bp_active(self, active: bool):
-        if self._bp_active != active:
-            self._bp_active = active
-            print(f"  [LED] BP LEDs (8-9) -> {'ACTIVE' if active else 'OFF'}")
+        self._bp_active = active
 
     def set_spo2_active(self, active: bool):
-        if self._spo2_active != active:
-            self._spo2_active = active
-            print(f"  [LED] SpO2 LEDs (4-5) -> {'ACTIVE' if active else 'OFF'}")
+        self._spo2_active = active
 
     def set_spo2_in_wait(self, active: bool):
-        if self._spo2_in_wait != active:
-            self._spo2_in_wait = active
-            print(f"  [LED] SpO2 wait-breathe -> {'ON' if active else 'OFF'}")
+        self._spo2_in_wait = active
 
     def set_gluc_active(self, active: bool):
-        if self._gluc_active != active:
-            self._gluc_active = active
-            print(f"  [LED] Gluc LEDs (2-3) -> {'ON' if active else 'OFF'}")
-
-    async def run(self):
-        # FIX: original code checked `if not self.pixels:` — that attribute
-        # never existed (only self.pixels_a / self.pixels_b do), so this
-        # raised AttributeError as soon as the task started. The task would
-        # fail silently in the background, the render loop never ran, and
-        # whatever raw/garbage/init color was already latched on the strip
-        # (commonly white) stayed on forever. THIS was your white-instead-
-        # of-green bug.
-        if not self.pixels_a and not self.pixels_b:
-            return
-        try:
-            while not self._stop:
-                self._render()
-                await asyncio.sleep(BREATH_FADE_DELAY)
-        finally:
-            self._all_off()
+        self._gluc_active = active
 
     def _render(self):
         if not self.pixels_a and not self.pixels_b:
             return
+
         elapsed = time.monotonic() - self._state_started
+
         if self.pixels_a:
-            for i in range(self.pixels_a.numPixels()):
-                self.pixels_a.setPixelColor(i, OFF)
+            self.pixels_a.fill((0, 0, 0))
+
         if self.pixels_b:
-            for i in range(self.pixels_b.numPixels()):
-                self.pixels_b.setPixelColor(i, OFF)
+            self.pixels_b.fill((0, 0, 0))
+
         self._set_pixels_a(LED_LOGO, WHITE)
 
         if self.state == LEDState.WAIT_BP:
-            f = self._breath_factor(elapsed)
-            self._set_pixels_b(LED_BP, self._scale(GREEN, f))
+            factor = self._breath_factor(elapsed)
+            self._set_pixels_b(LED_BP, self._scale(GREEN, factor))
+
             if self._spo2_in_wait:
-                self._set_pixels_b(LED_SPO2, self._scale(GREEN, f))
+                self._set_pixels_b(
+                    LED_SPO2,
+                    self._scale(GREEN, factor)
+                )
 
         elif self.state == LEDState.CAPTURE:
-            f = self._breath_factor(elapsed)
+            factor = self._breath_factor(elapsed)
+
             if self._bp_active:
-                self._set_pixels_b(LED_BP, self._scale(GREEN, f))
+                self._set_pixels_b(
+                    LED_BP,
+                    self._scale(GREEN, factor)
+                )
+
             if self._spo2_active:
-                self._set_pixels_b(LED_SPO2, self._scale(GREEN, f))
+                self._set_pixels_b(
+                    LED_SPO2,
+                    self._scale(GREEN, factor)
+                )
+
             if self._gluc_active:
                 self._set_pixels_a(LED_GLUC, GREEN)
 
@@ -505,15 +535,28 @@ class LEDController:
                 self._set_pixels_b(LED_MIC, GREEN)
 
         elif self.state == LEDState.ERROR:
-            self._set_pixels_b(LED_BP + LED_SPO2 + LED_MIC, RED)
+            self._set_pixels_b(
+                LED_BP + LED_SPO2 + LED_MIC,
+                RED
+            )
             self._set_pixels_a(LED_GLUC, RED)
 
         self._show()
 
+    async def run(self):
+        if not self.pixels_a and not self.pixels_b:
+            return
+
+        try:
+            while not self._stop:
+                self._render()
+                await asyncio.sleep(BREATH_FADE_DELAY)
+        finally:
+            self._all_off()
+
     def shutdown(self):
         self._stop = True
-        if self.pixels_a or self.pixels_b:
-            self._all_off()
+        self._all_off()
 
 # ---------------------------------------------------------------------------
 # BLE helpers
@@ -1213,7 +1256,7 @@ async def main():
     leds.set_state(LEDState.WAIT_BP)
 
     print("\n" + "=" * 60)
-    print("  O-Health Vitals Kiosk — rpi19")
+    print("  O-Health Vitals Kiosk — rpi24")
     print("=" * 60)
 
     await drain_spool()
