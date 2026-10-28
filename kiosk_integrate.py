@@ -5,6 +5,7 @@ import csv
 import json
 import shutil
 import socket
+import subprocess
 import time
 import urllib.request
 import urllib.error
@@ -18,9 +19,6 @@ from bleak.args.bluez import BlueZNotifyArgs
 import pexpect
 from dbus_fast.aio import MessageBus
 from dbus_fast import BusType, Variant, Message, MessageType
-import board
-import busio
-import neopixel_spi as neopixel
 
 try:
     import board
@@ -36,7 +34,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
 BACKEND_URL          = "https://prod.o-health.in/api/v2/vitals/update"
 CLEARVITALS_POLL_URL = "https://prod.o-health.in/api/v2/vitals/latestVitalsForKiosk"
 STATUS_URL           = "https://prod.o-health.in/api/v2/vitals/updateStatus"
@@ -44,11 +41,11 @@ STATUS_URL           = "https://prod.o-health.in/api/v2/vitals/updateStatus"
 KIOSK_ID             = socket.gethostname()
 SPOOL_DIR            = Path.home() / "vitals_spool"
 VIDEO_BASE_DIR       = Path.home() / "videos"
-ALT_VIDEO_ROOT       = Path("/home/rpi23/VIDEOS")
+ALT_VIDEO_ROOT       = Path("/home/rpi28/VIDEOS")
 LOG_DIR              = Path.home() / "vitals_logs"
 CONSOLE_LOG_PATH     = LOG_DIR / "vitals_kiosk_console.log"
 SESSION_CSV_PATH     = LOG_DIR / "vitals_kiosk_sessions.csv"
-DOWNLOADS_DIR        = Path("/home/rpi23/Downloads")
+DOWNLOADS_DIR        = Path("/home/rpi28/Downloads")
 DOWNLOADS_LOG_PATH   = DOWNLOADS_DIR / "logsuser.txt"
 DOWNLOADS_CSV_PATH   = DOWNLOADS_DIR / "logs.csv"
 
@@ -62,10 +59,12 @@ POLL_INTERVAL_SECS           = 15
 POLL_TIMEOUT_SECS            = 8
 BP_MEASURE_TIMEOUT           = 90
 SPO2_MEASURE_TIMEOUT         = 90
+SPO2_CONNECT_TIMEOUT         = 15
+SPO2_SCAN_TIMEOUT            = 20
+SPO2_MIN_VALID               = 70
+SPO2_STABLE_COUNT            = 3
 PATIENT_IDLE_PRINT_EVERY     = 60
 TEMP_WAIT_AFTER_SPO2         = 0
-PARALLEL_DISCOVERY_SECS      = 40
-SENSOR_CONNECT_ATTEMPTS      = 3
 CAMERA_DEVICE                = "/dev/video0"
 CAMERA_RECORD_SECS           = 5
 GLUC_ON_SECS                 = 10
@@ -73,33 +72,29 @@ LOCKOUT_SECS                 = 180
 POST_PRIMARY_FALLBACK_SCAN_SECS = 10
 BLE_DEBUG_LOG                = False
 
-BP_ALLOWED_MAC   = "FF:FF:11:9C:90:1A"
-BP_NAME_HINTS    = ["JPD", "BPM", "TRACKY"]
-BP_NOTIFY        = "0000fff1-0000-1000-8000-00805f9b34fb"
-NOTIFY_ARGS      = BlueZNotifyArgs(use_start_notify=True)
+BP_ALLOWED_MAC   = "FF:FF:11:9C:97:2C"   # JPD BPM (rpi 28)
+SPO2_ALLOWED_MAC = "10:22:33:0C:AA:11"   # YK-80B (rpi 28)
+GLUC_ALLOWED_MAC = "EC:09:C9:09:A3:3F"   # meter+25550596 (rpi 28)
 
-SPO2_ALLOWED_MAC   = "10:22:33:41:5F:1B"
-SPO2_NAME_HINTS    = ["OXIMETER", "MY OXIMETER", "YK-80B"]
-SPO2_NOTIFY        = "cdeacb81-5235-4c07-8846-93a37ee6b86d"
-SPO2_STABLE_COUNT  = 6
-SPO2_MIN_VALID     = 85    # reject readings below this before adding to stable buffer
+BP_NAME_HINTS    = ["JPD", "BPM", "TRACKY"]
+SPO2_NAME_HINTS  = ["YK-80B", "OXIMETER", "MY OXIMETER"]
+GLUC_NAME_HINTS  = ["METER+", "METER"]
+
+BP_NOTIFY        = "0000fff1-0000-1000-8000-00805f9b34fb"
+SPO2_NOTIFY      = "cdeacd81-5235-4c07-8846-93a37ee6b86d"
+NOTIFY_ARGS      = BlueZNotifyArgs(use_start_notify=True)
 
 NULL_BP   = {"sys": None, "dia": None, "pul": None}
 NULL_SPO2 = {"spo2": None, "pr": None, "pi": None}
-NULL_TEMP = {
-    "ambient_c": None,
-    "object_c": None,
-    "object_c_raw": None,
-    "display_source": None,
-    "samples": None,
-}
+NULL_TEMP = {"ambient_c": None, "object_c": None, "object_c_raw": None,
+             "display_source": None, "samples": None}
 
 TEMP_SERVICE_UUID        = "0000fff0-0000-1000-8000-00805f9b34fb"
 TEMP_NOTIFY_UUID         = "0000fff3-0000-1000-8000-00805f9b34fb"
-TEMP_ALLOWED_MAC         = "FF:FF:11:70:71:2A"
+TEMP_ALLOWED_MAC         = "FF:FF:11:70:78:95"   # My Thermometer (rpi 28)
 TEMP_NAME_HINTS          = ["THERMOMETER", "MY THERMOMETER"]
 TEMP_BLE_CONNECT_TIMEOUT = 60
-TEMP_BLE_MEASURE_TIMEOUT = 60
+TEMP_BLE_MEASURE_TIMEOUT = 90
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -297,39 +292,29 @@ async def _check_clearvitals():
     return await loop.run_in_executor(None, _check_clearvitals_sync)
 
 # ---------------------------------------------------------------------------
-# LED controller
+# LED controller — Raspberry Pi 5 dual-SPI NeoPixel edition
 # ---------------------------------------------------------------------------
 
-LED_FREQ_HZ    = 800000
-LED_INVERT     = False
-LED_BRIGHTNESS = 128
+LED_COUNT_A = 4
+LED_LOGO    = [0, 1]
+LED_GLUC    = [2, 3]
 
-# Strip A — GPIO 10 (DMA 5): LOGO + GLUC
-LED_COUNT_A    = 4
-LED_PIN_A      = 10
-LED_DMA_A      = 5
-LED_LOGO       = [0, 1]
-LED_GLUC       = [2, 3]
+LED_COUNT_B = 6
+LED_BP      = [0, 1]
+LED_MIC     = [2, 3]
+LED_SPO2    = [4, 5]
 
-# Strip B — SPI1 GPIO 20: SPO2 + MIC + BP
-LED_COUNT_B    = 6
-LED_PIN_B      = 20
-LED_DMA_B      = 8
-LED_BP         = [0, 1]
-LED_MIC        = [2, 3]
-LED_SPO2       = [4, 5]
+GREEN = (0, 255, 0)
+WHITE = (255, 255, 255)
+RED   = (255, 0, 0)
+OFF   = (0, 0, 0)
 
-def _c(r, g, b):
-    return (r << 16) | (g << 8) | b
+LED_BRIGHTNESS    = 128 / 255
+BREATH_FADE_STEPS = 30
+BREATH_FADE_DELAY = 0.03
+BREATH_HOLD_SECS  = 0.35
+ERROR_BLINK_SECS  = 0.45
 
-GREEN = _c(0, 255, 0)
-WHITE = _c(255, 255, 255)
-RED   = _c(255, 0, 0)
-OFF   = _c(0, 0, 0)
-
-BREATH_FADE_STEPS = 25
-BREATH_FADE_DELAY = 0.04
-BREATH_HOLD_SECS  = 0.5
 
 class LEDState(Enum):
     OFF       = "off"
@@ -338,10 +323,11 @@ class LEDState(Enum):
     POST_FLOW = "post_flow"
     ERROR     = "error"
 
+
 class LEDController:
     def __init__(self):
-        self.pixels_a = None
-        self.pixels_b = None
+        self.strip_a = None
+        self.strip_b = None
         self.state = LEDState.OFF
         self._state_started = time.monotonic()
         self._stop = False
@@ -349,209 +335,120 @@ class LEDController:
         self._spo2_active = False
         self._spo2_in_wait = False
         self._gluc_active = False
-
         if not HAS_LEDS:
+            print("[warn] LED libraries unavailable — LED indicators disabled")
             return
-
         try:
-            self.spi0 = board.SPI()
-            self.spi1 = busio.SPI(
-                clock=board.D21,
-                MOSI=board.D20,
-                MISO=board.D19
-            )
-
-            self.pixels_a = neopixel.NeoPixel_SPI(
-                spi=self.spi0,
+            self.strip_a = neopixel.NeoPixel_SPI(
+                spi=board.SPI(),
                 n=LED_COUNT_A,
                 pixel_order=neopixel.GRB,
-                brightness=LED_BRIGHTNESS / 255.0,
-                auto_write=False
+                brightness=LED_BRIGHTNESS,
+                auto_write=False,
             )
-
-            self.pixels_b = neopixel.NeoPixel_SPI(
-                spi=self.spi1,
+            print("  ✓ LED strip A (SPI0 / GPIO 10) online.")
+        except Exception as e:
+            print(f"  [warn] LED strip A init failed: {e}")
+            self.strip_a = None
+        try:
+            spi1 = busio.SPI(board.SCK_1, MOSI=board.MOSI_1, MISO=board.MISO_1)
+            self.strip_b = neopixel.NeoPixel_SPI(
+                spi=spi1,
                 n=LED_COUNT_B,
                 pixel_order=neopixel.GRB,
-                brightness=LED_BRIGHTNESS / 255.0,
-                auto_write=False
+                brightness=LED_BRIGHTNESS,
+                auto_write=False,
             )
-
-            self._all_off()
-            self._set_pixels_a(LED_LOGO, WHITE)
-            self._show()
-
-            print("  [LED] SPI0 GPIO10 initialized")
-            print("  [LED] SPI1 GPIO20 initialized")
-
+            print("  ✓ LED strip B (SPI1 / GPIO 20) online.")
         except Exception as e:
-            print(f"  [warn] LED init failed: {type(e).__name__}: {e}")
-            self.pixels_a = None
-            self.pixels_b = None
+            print(f"  [warn] LED strip B init failed: {e}")
+            self.strip_b = None
+        self._all_off()
+        self._set_pixels(self.strip_a, LED_LOGO, WHITE)
+        self._show()
 
-    @staticmethod
-    def _rgb(color):
-        return (
-            (color >> 16) & 0xFF,
-            (color >> 8) & 0xFF,
-            color & 0xFF
-        )
+    @property
+    def strip(self):
+        return self.strip_a or self.strip_b
 
     def _all_off(self):
-        if self.pixels_a:
-            self.pixels_a.fill((0, 0, 0))
-            self.pixels_a.show()
-
-        if self.pixels_b:
-            self.pixels_b.fill((0, 0, 0))
-            self.pixels_b.show()
-
-    def _set_pixels_a(self, leds, color):
-        if not self.pixels_a:
+        if not self.strip:
             return
+        self._fill_all(OFF)
+        self._show()
 
-        rgb = self._rgb(color)
-        for i in leds:
-            self.pixels_a[i] = rgb
+    def _fill_all(self, color):
+        for strip in (self.strip_a, self.strip_b):
+            if strip:
+                strip.fill(color)
 
-    def _set_pixels_b(self, leds, color):
-        if not self.pixels_b:
+    def _set_pixels(self, strip, leds, color):
+        if not strip:
             return
-
-        rgb = self._rgb(color)
-        for i in leds:
-            self.pixels_b[i] = rgb
+        for index in leds:
+            strip[index] = color
 
     def _show(self):
-        if self.pixels_a:
-            self.pixels_a.show()
-
-        if self.pixels_b:
-            self.pixels_b.show()
+        for strip in (self.strip_a, self.strip_b):
+            if strip:
+                strip.show()
 
     @staticmethod
     def _scale(color, factor):
-        r = (color >> 16) & 0xFF
-        g = (color >> 8) & 0xFF
-        b = color & 0xFF
-        return _c(int(r * factor), int(g * factor), int(b * factor))
+        factor = max(0.0, min(1.0, factor))
+        return tuple(int(channel * factor) for channel in color)
 
     @staticmethod
     def _breath_factor(elapsed):
-        cycle_len = (
-            2 * (BREATH_FADE_STEPS * BREATH_FADE_DELAY)
-            + 2 * BREATH_HOLD_SECS
-        )
-        t = elapsed % cycle_len
-        fade_dur = BREATH_FADE_STEPS * BREATH_FADE_DELAY
-
-        if t < fade_dur:
-            return t / fade_dur
-
-        t -= fade_dur
+        fade_duration = BREATH_FADE_STEPS * BREATH_FADE_DELAY
+        cycle = (2 * fade_duration) + (2 * BREATH_HOLD_SECS)
+        t = elapsed % cycle
+        if t < fade_duration:
+            return t / fade_duration
+        t -= fade_duration
         if t < BREATH_HOLD_SECS:
             return 1.0
-
         t -= BREATH_HOLD_SECS
-        if t < fade_dur:
-            return 1.0 - (t / fade_dur)
-
+        if t < fade_duration:
+            return 1.0 - (t / fade_duration)
         return 0.0
 
     def set_state(self, new_state: LEDState):
-        if self.state != new_state:
-            print(f"  [LED] {self.state.value} -> {new_state.value}")
-            self.state = new_state
-            self._state_started = time.monotonic()
-
-            if new_state in (
-                LEDState.OFF,
-                LEDState.ERROR,
-                LEDState.POST_FLOW
-            ):
-                self._bp_active = False
-                self._spo2_active = False
-                self._gluc_active = False
-
-            if new_state in (
-                LEDState.CAPTURE,
-                LEDState.POST_FLOW,
-                LEDState.OFF,
-                LEDState.ERROR
-            ):
-                self._spo2_in_wait = False
+        if self.state == new_state:
+            return
+        print(f"  [LED] {self.state.value} -> {new_state.value}")
+        self.state = new_state
+        self._state_started = time.monotonic()
+        if new_state in (LEDState.OFF, LEDState.ERROR, LEDState.POST_FLOW):
+            self._bp_active = False
+            self._spo2_active = False
+            self._gluc_active = False
+        if new_state != LEDState.WAIT_BP:
+            self._spo2_in_wait = False
 
     def set_bp_active(self, active: bool):
-        self._bp_active = active
+        if self._bp_active != active:
+            self._bp_active = active
+            print(f"  [LED] BP LEDs (B 0-1) -> {'ACTIVE' if active else 'OFF'}")
 
     def set_spo2_active(self, active: bool):
-        self._spo2_active = active
+        if self._spo2_active != active:
+            self._spo2_active = active
+            print(f"  [LED] SpO2 LEDs (B 4-5) -> {'ACTIVE' if active else 'OFF'}")
 
     def set_spo2_in_wait(self, active: bool):
-        self._spo2_in_wait = active
+        if self._spo2_in_wait != active:
+            self._spo2_in_wait = active
+            print(f"  [LED] SpO2 wait-breathe -> {'ON' if active else 'OFF'}")
 
     def set_gluc_active(self, active: bool):
-        self._gluc_active = active
-
-    def _render(self):
-        if not self.pixels_a and not self.pixels_b:
-            return
-
-        elapsed = time.monotonic() - self._state_started
-
-        if self.pixels_a:
-            self.pixels_a.fill((0, 0, 0))
-
-        if self.pixels_b:
-            self.pixels_b.fill((0, 0, 0))
-
-        self._set_pixels_a(LED_LOGO, WHITE)
-
-        if self.state == LEDState.WAIT_BP:
-            factor = self._breath_factor(elapsed)
-            self._set_pixels_b(LED_BP, self._scale(GREEN, factor))
-
-            if self._spo2_in_wait:
-                self._set_pixels_b(
-                    LED_SPO2,
-                    self._scale(GREEN, factor)
-                )
-
-        elif self.state == LEDState.CAPTURE:
-            factor = self._breath_factor(elapsed)
-
-            if self._bp_active:
-                self._set_pixels_b(
-                    LED_BP,
-                    self._scale(GREEN, factor)
-                )
-
-            if self._spo2_active:
-                self._set_pixels_b(
-                    LED_SPO2,
-                    self._scale(GREEN, factor)
-                )
-
-            if self._gluc_active:
-                self._set_pixels_a(LED_GLUC, GREEN)
-
-        elif self.state == LEDState.POST_FLOW:
-            if elapsed < LOCKOUT_SECS:
-                self._set_pixels_b(LED_MIC, GREEN)
-
-        elif self.state == LEDState.ERROR:
-            self._set_pixels_b(
-                LED_BP + LED_SPO2 + LED_MIC,
-                RED
-            )
-            self._set_pixels_a(LED_GLUC, RED)
-
-        self._show()
+        if self._gluc_active != active:
+            self._gluc_active = active
+            print(f"  [LED] Gluc/Temp LEDs (A 2-3) -> {'ACTIVE' if active else 'OFF'}")
 
     async def run(self):
-        if not self.pixels_a and not self.pixels_b:
+        if not self.strip:
             return
-
         try:
             while not self._stop:
                 self._render()
@@ -559,9 +456,42 @@ class LEDController:
         finally:
             self._all_off()
 
+    def _render(self):
+        if not self.strip:
+            return
+        elapsed = time.monotonic() - self._state_started
+        self._fill_all(OFF)
+        self._set_pixels(self.strip_a, LED_LOGO, WHITE)
+
+        # Reliable Strip A handling for Gluc/Temp LEDs
+        if self._gluc_active:
+            breath = self._breath_factor(elapsed)
+            self._set_pixels(self.strip_a, LED_GLUC, self._scale(GREEN, breath))
+
+        if self.state == LEDState.WAIT_BP:
+            breath = self._breath_factor(elapsed)
+            self._set_pixels(self.strip_b, LED_BP, self._scale(GREEN, breath))
+            if self._spo2_in_wait:
+                self._set_pixels(self.strip_b, LED_SPO2, self._scale(GREEN, breath))
+        elif self.state == LEDState.CAPTURE:
+            breath = self._breath_factor(elapsed)
+            if self._bp_active:
+                self._set_pixels(self.strip_b, LED_BP, self._scale(GREEN, breath))
+            if self._spo2_active:
+                self._set_pixels(self.strip_b, LED_SPO2, self._scale(GREEN, breath))
+        elif self.state == LEDState.POST_FLOW:
+            if elapsed < LOCKOUT_SECS:
+                self._set_pixels(self.strip_b, LED_MIC, GREEN)
+        elif self.state == LEDState.ERROR:
+            if int(elapsed / ERROR_BLINK_SECS) % 2 == 0:
+                self._set_pixels(self.strip_a, LED_GLUC, RED)
+                self._set_pixels(self.strip_b, LED_BP + LED_MIC + LED_SPO2, RED)
+        self._show()
+
     def shutdown(self):
         self._stop = True
-        self._all_off()
+        if self.strip:
+            self._all_off()
 
 # ---------------------------------------------------------------------------
 # BLE helpers
@@ -602,11 +532,6 @@ async def scan_known_devices(timeout=SCAN_TIMEOUT):
 async def scan_for_specific_device(kind: str, timeout: int, leds=None):
     print(f"  [{kind}] Scanning up to {timeout}s for connection...")
     try:
-        if leds:
-            if kind == "BP":
-                leds.set_bp_active(True)
-            elif kind == "SpO2":
-                leds.set_spo2_active(True)
         start = time.monotonic()
         while time.monotonic() - start < timeout:
             remaining = timeout - (time.monotonic() - start)
@@ -622,11 +547,7 @@ async def scan_for_specific_device(kind: str, timeout: int, leds=None):
         print(f"  [{kind}] Not found within {timeout}s — skipping {kind}.")
         return None
     finally:
-        if leds:
-            if kind == "BP":
-                leds.set_bp_active(False)
-            elif kind == "SpO2":
-                leds.set_spo2_active(False)
+        pass
 
 async def wait_for_patient_device(leds=None):
     print("\n>>> WAITING FOR PATIENT — power on BP cuff OR SpO2 to begin <<<\n")
@@ -704,25 +625,25 @@ class BPSession:
                         print(f"  [BP] start_notify attempt {attempt} failed: {type(exc).__name__}: {exc}")
                         continue
                     print(f"  [BP] Notify subscribed ✓ (attempt {attempt})")
+                    if self.leds:
+                        self.leds.set_bp_active(True)
                     return
                 else:
-                    print(f"  [BP] Notify subscription pending (attempt {attempt}, continuing)")
                     try:
                         await t
                         print(f"  [BP] Notify subscribed ✓ (attempt {attempt}, late)")
+                        if self.leds:
+                            self.leds.set_bp_active(True)
                         return
                     except Exception as e:
                         if self.done.is_set():
                             return
-                        print(f"  [BP] start_notify attempt {attempt} failed late: {type(e).__name__}: {e}")
                         continue
 
             if not self.done.is_set() and attempt >= max_retries:
                 print(f"  [BP] Gave up resubscribing after {max_retries} attempts.")
 
         try:
-            if self.leds:
-                self.leds.set_bp_active(True)
             update_status("bp", "start")
             async with _ble_adapter_lock:
                 await client.connect()
@@ -760,100 +681,124 @@ class BPSession:
         return self.result
 
 # ---------------------------------------------------------------------------
-# SpO2 — bluetoothctl connection + BlueZ D-Bus notifications
+# SpO2 — YK-80B / My Oximeter (with built-in retry mechanism)
 # ---------------------------------------------------------------------------
+
+SPO2_READINGS        = 10          
+SPO2_FRAME_ORDER     = "pr_spo2"    
+SPO2_PREFERRED_UUIDS = ("cdeacd81", "0000ffe2", "cdeacb81")
 
 def _spo2_valid(spo2, pr):
     return SPO2_MIN_VALID <= spo2 <= 100 and 30 <= pr <= 250
 
-
 def _close_btctl(child):
-    if child is None:
+    if not child:
         return
+    for command in ("scan off", f"disconnect {SPO2_ALLOWED_MAC}", "quit"):
+        try:
+            child.sendline(command)
+        except Exception:
+            pass
     try:
-        child.sendline(f"disconnect {SPO2_ALLOWED_MAC}")
-        child.sendline("quit")
         child.close()
     except Exception:
         pass
 
-
 def _bluetoothctl_connect_spo2():
     print("  [SpO2] Connecting through bluetoothctl...")
-    child = pexpect.spawn("bluetoothctl", encoding="utf-8", timeout=10)
     try:
+        subprocess.run(["pkill", "-f", "bluetoothctl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.5)
-        child.sendline("scan on")
-        time.sleep(5)
-        child.sendline(f"trust {SPO2_ALLOWED_MAC}")
-        time.sleep(0.5)
-        child.sendline(f"connect {SPO2_ALLOWED_MAC}")
-        result = child.expect(
-            [r"ServicesResolved: yes", r"Connection successful",
-             pexpect.TIMEOUT, pexpect.EOF],
-            timeout=30,
-        )
-        if result in (0, 1):
-            print("  [SpO2] Connected via bluetoothctl ✓")
-            return child
-        print("  [SpO2] bluetoothctl connection timed out or closed.")
-    except Exception as e:
-        print(f"  [SpO2] bluetoothctl error: {type(e).__name__}: {e}")
-    _close_btctl(child)
+    except Exception:
+        pass
+
+    # Retry connection loop up to 2 times
+    for attempt in range(1, 3):
+        if attempt > 1:
+            print(f"  [SpO2] Retrying bluetoothctl connection (attempt {attempt}/2)...")
+            time.sleep(2)
+
+        child = pexpect.spawn("bluetoothctl", encoding="utf-8", timeout=10)
+        try:
+            time.sleep(0.5)
+            child.sendline(f"disconnect {SPO2_ALLOWED_MAC}")
+            time.sleep(0.5)
+            child.sendline("scan on")
+            print("  [SpO2] Scanning for devices...")
+            time.sleep(3)
+            child.sendline(f"trust {SPO2_ALLOWED_MAC}")
+            time.sleep(0.5)
+            child.sendline(f"connect {SPO2_ALLOWED_MAC}")
+            print("  [SpO2] Connecting...")
+            index = child.expect(
+                [r"ServicesResolved: yes", r"Connection successful",
+                 r"Failed to connect", pexpect.TIMEOUT, pexpect.EOF],
+                timeout=25,
+            )
+            if index in (0, 1):
+                print("  [SpO2] Connected via bluetoothctl ✓")
+                return child
+            print(f"  [SpO2] bluetoothctl attempt {attempt} failed.")
+            _close_btctl(child)
+        except Exception as e:
+            print(f"  [SpO2] bluetoothctl error on attempt {attempt}: {type(e).__name__}: {e}")
+            _close_btctl(child)
     return None
 
-
 async def _find_spo2_notify_characteristic(bus):
-    intro = await bus.introspect("org.bluez", "/")
-    obj = bus.get_proxy_object("org.bluez", "/", intro)
-    manager = obj.get_interface("org.freedesktop.DBus.ObjectManager")
-    managed = await manager.call_get_managed_objects()
+    root_intro = await bus.introspect("org.bluez", "/")
+    root_obj = bus.get_proxy_object("org.bluez", "/", root_intro)
+    om = root_obj.get_interface("org.freedesktop.DBus.ObjectManager")
+    managed = await om.call_get_managed_objects()
     suffix = SPO2_ALLOWED_MAC.upper().replace(":", "_")
+    candidates = []
     for path, interfaces in managed.items():
         if suffix not in path.upper():
             continue
-        characteristic = interfaces.get("org.bluez.GattCharacteristic1")
-        if not characteristic:
+        ch = interfaces.get("org.bluez.GattCharacteristic1")
+        if not ch:
             continue
-        flags = characteristic.get("Flags", [])
-        if isinstance(flags, Variant):
-            flags = flags.value
-        if "notify" in flags or "indicate" in flags:
+        flags = ch.get("Flags", [])
+        flags = flags.value if isinstance(flags, Variant) else flags
+        uuid = ch.get("UUID", "")
+        uuid = uuid.value if isinstance(uuid, Variant) else uuid
+        if any(f in flags for f in ("notify", "indicate")):
+            candidates.append((path, str(uuid).lower()))
+    for path, uuid in candidates:
+        if uuid == SPO2_NOTIFY.lower() or uuid.startswith(SPO2_PREFERRED_UUIDS):
             return path
-    return None
+    return candidates[0][0] if candidates else None
 
-
-async def capture_spo2_new():
+async def capture_spo2_new(leds=None):
     readings = []
-    done = asyncio.Event()
+    done_event = asyncio.Event()
     child = None
     bus = None
-
-    async with _ble_adapter_lock:
-        for attempt in range(1, SENSOR_CONNECT_ATTEMPTS + 1):
-            print(f"  [SpO2] Connection attempt {attempt}/{SENSOR_CONNECT_ATTEMPTS}")
+    char_gatt = None
+    try:
+        async with _ble_adapter_lock:
             child = await asyncio.to_thread(_bluetoothctl_connect_spo2)
-            if child is not None:
-                break
-            if attempt < SENSOR_CONNECT_ATTEMPTS:
-                await asyncio.sleep(2)
-        if child is None:
-            print("  [SpO2] All connection attempts failed.")
-            return None
-        try:
+            if child is None:
+                return None
+
             await asyncio.sleep(2)
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            path = await _find_spo2_notify_characteristic(bus)
-            if path is None:
+            char_path = None
+            for _ in range(10):
+                char_path = await _find_spo2_notify_characteristic(bus)
+                if char_path:
+                    break
+                await asyncio.sleep(1)
+            if not char_path:
                 print("  [SpO2] Notify characteristic not found.")
                 return None
 
-            print(f"  [SpO2] Notify characteristic: {path}")
-
             def on_signal(message):
-                if (message.message_type != MessageType.SIGNAL
-                        or message.member != "PropertiesChanged"
-                        or message.path != path):
+                if message.message_type != MessageType.SIGNAL:
+                    return
+                if message.member != "PropertiesChanged" or message.path != char_path:
+                    return
+                if not message.body or message.body[0] != "org.bluez.GattCharacteristic1":
                     return
                 changed = message.body[1]
                 if not isinstance(changed, dict) or "Value" not in changed:
@@ -862,203 +807,158 @@ async def capture_spo2_new():
                 data = bytes(value.value if isinstance(value, Variant) else value)
                 if len(data) < 4 or data[0] != 0x81:
                     return
-                spo2 = data[1]
-                pr = data[2]
+                if SPO2_FRAME_ORDER == "pr_spo2":
+                    pr, spo2 = data[1], data[2]
+                else:
+                    spo2, pr = data[1], data[2]
                 pi = round(data[3] / 10.0, 1)
                 if not _spo2_valid(spo2, pr):
-                    print(f"  [SpO2] Invalid reading ignored: SpO2={spo2} PR={pr}")
-                    return
-                if done.is_set():
                     return
                 readings.append({"spo2": spo2, "pr": pr, "pi": pi})
-                print(f"  [SpO2] Reading #{len(readings)}: SpO2={spo2}% PR={pr} PI={pi:.1f}%")
-                if len(readings) >= SPO2_STABLE_COUNT:
-                    update_status("spo2", "stop")
-                    done.set()
+                print(f"  [SpO2] Reading #{len(readings)}: {spo2}% / PR {pr} / PI {pi:.1f}")
+                if len(readings) >= SPO2_READINGS:
+                    done_event.set()
 
             bus.add_message_handler(on_signal)
             await bus.call(Message(
-                destination="org.freedesktop.DBus",
-                path="/org/freedesktop/DBus",
-                interface="org.freedesktop.DBus",
-                member="AddMatch",
-                signature="s",
-                body=[
-                    "type='signal',sender='org.bluez',"
-                    "interface='org.freedesktop.DBus.Properties',"
-                    "member='PropertiesChanged',"
-                    f"path='{path}'"
-                ],
+                destination="org.freedesktop.DBus", path="/org/freedesktop/DBus",
+                interface="org.freedesktop.DBus", member="AddMatch", signature="s",
+                body=["type='signal',sender='org.bluez',"
+                      "interface='org.freedesktop.DBus.Properties',"
+                      "member='PropertiesChanged',"
+                      f"path='{char_path}'"],
             ))
-
-            char_intro = await bus.introspect("org.bluez", path)
-            char_obj = bus.get_proxy_object("org.bluez", path, char_intro)
+            char_intro = await bus.introspect("org.bluez", char_path)
+            char_obj = bus.get_proxy_object("org.bluez", char_path, char_intro)
             char_gatt = char_obj.get_interface("org.bluez.GattCharacteristic1")
             await char_gatt.call_start_notify()
-            update_status("spo2", "start")
-            print(f"  [SpO2] Insert finger; collecting {SPO2_STABLE_COUNT} valid readings.")
-            try:
-                await asyncio.wait_for(done.wait(), timeout=SPO2_MEASURE_TIMEOUT)
-            except asyncio.TimeoutError:
-                print(f"  [SpO2] Timeout; collected {len(readings)} valid readings.")
-                update_status("spo2", "stop")
-            finally:
-                try:
-                    await char_gatt.call_stop_notify()
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"  [SpO2] D-Bus error: {type(e).__name__}: {e}")
-            update_status("spo2", "stop")
-        finally:
-            if bus is not None:
-                try:
-                    bus.disconnect()
-                except Exception:
-                    pass
-            await asyncio.to_thread(_close_btctl, child)
 
-    if len(readings) >= SPO2_STABLE_COUNT:
-        result = readings[SPO2_STABLE_COUNT - 1]
-        print(f"  ✓ SpO2 (6th reading): {result['spo2']}% / PR {result['pr']} / PI {result['pi']:.1f}")
-        return result
+        print(f"  [SpO2] Notifications enabled. Insert finger. ({SPO2_MEASURE_TIMEOUT}s, {SPO2_READINGS} readings)")
+        try:
+            await asyncio.wait_for(done_event.wait(), timeout=SPO2_MEASURE_TIMEOUT)
+        except asyncio.TimeoutError:
+            print(f"  [SpO2] Timeout after {SPO2_MEASURE_TIMEOUT}s ({len(readings)} valid readings).")
+    except Exception as e:
+        print(f"  [SpO2] D-Bus error: {type(e).__name__}: {e}")
+    finally:
+        if char_gatt:
+            try:
+                await char_gatt.call_stop_notify()
+            except Exception:
+                pass
+        if bus:
+            try:
+                bus.disconnect()
+            except Exception:
+                pass
+        _close_btctl(child)
+
+    if len(readings) >= SPO2_READINGS:
+        last = readings[-1]
+        print(f"  ✓ SpO2 (reading #{SPO2_READINGS}): {last['spo2']}% / PR {last['pr']} / PI {last['pi']:.1f}")
+        return last
     return None
 
-
 class SpO2Session:
-    def __init__(self, warmup_frames=1, leds=None):
+    def __init__(self, leds=None):
         self.leds = leds
 
     async def run(self, device=None):
         if self.leds:
             self.leds.set_spo2_active(True)
+        update_status("spo2", "start")
+        result = None
         try:
-            return await capture_spo2_new()
+            result = await capture_spo2_new(leds=self.leds)
+        except Exception as e:
+            print(f"  [SpO2] Measurement failed: {type(e).__name__}: {e}")
         finally:
+            update_status("spo2", "stop")
             if self.leds:
                 self.leds.set_spo2_active(False)
-
+        return result
 
 # ---------------------------------------------------------------------------
 # Temperature sensor
 # ---------------------------------------------------------------------------
 
 class TempSensor:
-    def __init__(self):
+    def __init__(self, leds=None):
+        self.leds = leds
         self._celsius = None
         self._done = asyncio.Event()
 
     def _on_notify(self, _handle, data: bytearray):
         if self._done.is_set():
             return
-        print(f"  [Temp BLE packet] {' '.join(f'{b:02X}' for b in data)}  len={len(data)}")
         if len(data) == 5 and data[0] == 0xAA and data[1] == 0x33:
             try:
                 raw_value = int.from_bytes(data[2:4], byteorder="big", signed=False)
                 self._celsius = raw_value / 100.0
-                print(f"  [Temp BLE raw] {' '.join(f'{b:02X}' for b in data)}")
                 self._done.set()
             except Exception as e:
                 print(f"  [Temp BLE parse error] {e}")
 
     async def _find_device(self):
-        deadline = time.monotonic() + PARALLEL_DISCOVERY_SECS
-        attempt = 0
-
-        while time.monotonic() < deadline:
-            attempt += 1
-            remaining = deadline - time.monotonic()
-            print(f"  [Temp] Search attempt {attempt}; {remaining:.0f}s left")
-
-            try:
-                device = await BleakScanner.find_device_by_address(
-                    TEMP_ALLOWED_MAC, timeout=min(5, remaining)
-                )
-                if device:
-                    print(f"  [Temp] Found by MAC: {device.address}")
-                    return device
-            except Exception as exc:
-                print(f"  [Temp] MAC search error: {type(exc).__name__}: {exc}")
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-
-            try:
-                devices = await BleakScanner.discover(timeout=min(5, remaining))
-                for device in devices:
-                    name = (device.name or "").upper()
-                    if (device.address.upper() == TEMP_ALLOWED_MAC.upper()
-                            or any(hint in name for hint in TEMP_NAME_HINTS)):
-                        print(
-                            f"  [Temp] Found: {device.name or device.address} "
-                            f"@ {device.address}"
-                        )
-                        return device
-            except Exception as exc:
-                print(f"  [Temp] Name search error: {type(exc).__name__}: {exc}")
-
-        print(f"  [Temp] Not found within {PARALLEL_DISCOVERY_SECS}s.")
-        return None
+        device = await BleakScanner.find_device_by_address(TEMP_ALLOWED_MAC, timeout=8)
+        if not device:
+            devices = await BleakScanner.discover(timeout=8)
+            for d in devices:
+                if d.name and any(h in d.name.upper() for h in TEMP_NAME_HINTS):
+                    device = d
+                    break
+        return device
 
     async def read_average(self):
+        await asyncio.sleep(TEMP_WAIT_AFTER_SPO2)
         self._celsius = None
         self._done.clear()
 
-        device = await self._find_device()
-        if not device:
-            print("  [Temp] Thermometer not found — press measure to wake BLE.")
-            return None
+        if self.leds:
+            self.leds.set_gluc_active(True)
 
-        for attempt in range(1, SENSOR_CONNECT_ATTEMPTS + 1):
-            client = BleakClient(device, timeout=TEMP_BLE_CONNECT_TIMEOUT)
-            try:
-                print(f"  [Temp] Connection attempt {attempt}/{SENSOR_CONNECT_ATTEMPTS}")
-                async with _ble_adapter_lock:
-                    await client.connect()
+        try:
+            device = await self._find_device()
+            if not device:
+                print("  [Temp] Thermometer not found.")
+                return None
 
-                print("  [Temp] Connected; subscribing to FFF3...")
+            print(f"  [Temp] Connecting to {device.name or device.address}...")
+            await asyncio.sleep(2)
+            
+            async with BleakClient(device, timeout=TEMP_BLE_CONNECT_TIMEOUT) as client:
                 await client.start_notify(
                     TEMP_NOTIFY_UUID,
                     self._on_notify,
                     bluez=BlueZNotifyArgs(use_start_notify=True),
                 )
+                print(f"  [Temp] Waiting up to {TEMP_BLE_MEASURE_TIMEOUT}s — take a forehead measurement NOW...")
                 update_status("temp", "start")
-                print(
-                    f"  [Temp] Take a forehead measurement now "
-                    f"({TEMP_BLE_MEASURE_TIMEOUT}s)."
-                )
                 try:
-                    await asyncio.wait_for(
-                        self._done.wait(), timeout=TEMP_BLE_MEASURE_TIMEOUT
-                    )
+                    await asyncio.wait_for(self._done.wait(), timeout=TEMP_BLE_MEASURE_TIMEOUT)
                 except asyncio.TimeoutError:
-                    print("  [Temp] Connected, but no measurement packet arrived.")
+                    print("  [Temp] Timeout — no packet received.")
+                    update_status("temp", "stop")
                 finally:
                     try:
                         await client.stop_notify(TEMP_NOTIFY_UUID)
                     except Exception:
                         pass
-                break
-            except Exception as exc:
-                print(f"  [Temp] Attempt {attempt} failed: {type(exc).__name__}: {exc}")
-                if attempt < SENSOR_CONNECT_ATTEMPTS:
-                    await asyncio.sleep(2)
-            finally:
-                try:
-                    if client.is_connected:
-                        async with _ble_adapter_lock:
-                            await client.disconnect()
-                except Exception as exc:
-                    print(f"  [Temp] Disconnect warning: {exc}")
+        except Exception as e:
+            print(f"  [Temp] BLE failed: {type(e).__name__}: {e}")
+            update_status("temp", "stop")
+            return None
+        finally:
+            if self.leds:
+                self.leds.set_gluc_active(False)
 
-        update_status("temp", "stop")
         if self._celsius is None:
             return None
 
         celsius = self._celsius
         fahrenheit = round(celsius * 9.0 / 5.0 + 32.0, 2)
-        print(f"  Temp: {celsius:.2f}C ({fahrenheit:.2f}F) [ble_direct]")
+        print(f"  Temp: {celsius:.2f}C  ({fahrenheit:.2f}F)  [ble_direct]")
+        update_status("temp", "stop")
         return {
             "ambient_c": None,
             "object_c": fahrenheit,
@@ -1074,14 +974,10 @@ class TempSensor:
 async def push_to_backend_with_retry(record):
     total = 1 + PUSH_RETRIES
     for attempt in range(1, total + 1):
-        print(f"\n  [push attempt {attempt}/{total}] -> {BACKEND_URL}")
         if await _push_once_async(record):
-            print("  Pushed.")
             return True
         if attempt < total:
-            print(f"  Will retry in {PUSH_RETRY_DELAY}s...")
             await asyncio.sleep(PUSH_RETRY_DELAY)
-    print(f"  All {total} push attempts failed.")
     return False
 
 async def push_partial(record_base: dict, bp, spo2, temp, partial: bool):
@@ -1092,9 +988,6 @@ async def push_partial(record_base: dict, bp, spo2, temp, partial: bool):
         "temp": temp if temp is not None else NULL_TEMP,
         "partial": partial,
     }
-    label = "partial" if partial else "final"
-    print(f"\n  [SSE {label} push] bp={'captured' if bp else 'null'}  "
-          f"spo2={'captured' if spo2 else 'null'}  temp={'captured' if temp else 'null'}")
     if partial:
         _track(_push_once_async(snapshot))
         return None
@@ -1108,45 +1001,27 @@ def spool_to_disk(record):
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
     path = SPOOL_DIR / f"vitals_{int(time.time())}.json"
     path.write_text(json.dumps(record, indent=2))
-    print(f"  Spooled: {path}")
 
 async def drain_spool():
     if not SPOOL_DIR.exists():
         return
     loop = asyncio.get_running_loop()
-    files = sorted(SPOOL_DIR.glob("vitals_*.json"))
-    for f in files:
+    for f in sorted(SPOOL_DIR.glob("vitals_*.json")):
         try:
-            raw = f.read_text().strip()
-            if not raw:
-                print(f"  [spool] Removing empty spool file {f.name}")
+            record = json.loads(f.read_text().strip())
+            if await loop.run_in_executor(None, _push_once, record):
                 f.unlink()
-                continue
-            record = json.loads(raw)
-            ok = await loop.run_in_executor(None, _push_once, record)
-            if ok:
-                f.unlink()
-                print(f"  [spool] Pushed and removed {f.name}")
             else:
                 break
-        except json.JSONDecodeError:
-            print(f"  [spool] Removing corrupt JSON spool file {f.name}")
-            try:
-                f.unlink()
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"  [spool] Skipping {f.name}: {e}")
+        except Exception:
+            pass
 
 async def poll_for_clearvitals(skip_event: asyncio.Event) -> None:
-    print(f"  [poll] Polling latestVitalsForKiosk every {POLL_INTERVAL_SECS}s — will exit lockout early if data becomes null (clearvitals called)")
     while not skip_event.is_set():
         await asyncio.sleep(POLL_INTERVAL_SECS)
         if skip_event.is_set():
             return
-        triggered = await _check_clearvitals()
-        if triggered:
-            print("  [poll] clearvitals signal received — ending lockout early")
+        if await _check_clearvitals():
             skip_event.set()
             return
 
@@ -1187,12 +1062,11 @@ async def record_video(patient_num: int, leds):
             print(f"  [Camera] ✓ Saved: {out_path}")
             try:
                 shutil.copy2(out_path, alt_path)
-                print(f"  [Camera] ✓ Copied: {alt_path}")
-            except Exception as copy_err:
-                print(f"  [Camera] Copy failed: {type(copy_err).__name__}: {copy_err}")
+            except Exception:
+                pass
         else:
             err = stderr.decode(errors="replace").strip().splitlines()
-            print(f"  [Camera] ffmpeg error (rc={proc.returncode}): {err[-1] if err else '(no output)'}")
+            print(f"  [Camera] ffmpeg error: {err[-1] if err else '(no output)'}")
     except Exception as e:
         print(f"  [Camera] Error: {type(e).__name__}: {e}")
 
@@ -1218,6 +1092,7 @@ async def run_patient_capture(patient_num, bp_dev, spo2_dev, temp_sensor, leds):
     leds.set_state(LEDState.CAPTURE)
     leds.set_bp_active(False)
     leds.set_spo2_active(False)
+    leds.set_gluc_active(False)
 
     print("\n=== BP + SpO2 (parallel) ===")
 
@@ -1231,90 +1106,52 @@ async def run_patient_capture(patient_num, bp_dev, spo2_dev, temp_sensor, leds):
         found = await scan_for_specific_device("BP", CONNECT_TIMEOUT, leds=leds)
         if found:
             return await BPSession(leds=leds).run(found)
-        print("  [Flow] BP device not found during background scan — skipping.")
         return None
 
     async def _run_spo2(device):
-        await asyncio.sleep(6)  # give BP a clean window to connect before SpO2 acquires adapter
+        await asyncio.sleep(4)
         return await SpO2Session(leds=leds).run(device)
 
     async def _scan_then_spo2():
-        found = await scan_for_specific_device("SpO2", PARALLEL_DISCOVERY_SECS, leds=leds)
+        found = await scan_for_specific_device("SpO2", SPO2_SCAN_TIMEOUT, leds=leds)
         if found:
             return await SpO2Session(leds=leds).run(found)
-        print("  [Flow] SpO2 device not found during background scan — skipping.")
+        print("  [Flow] SpO2 device not found during scan — skipping.")
         return None
 
     bp_coro = _run_bp(bp_dev) if bp_dev else _scan_then_bp()
     spo2_coro = _run_spo2(spo2_dev) if spo2_dev else _scan_then_spo2()
 
-    async def _run_temp():
-        # Give BP and SpO2 time to begin connecting, without waiting for
-        # either measurement to finish.
-        await asyncio.sleep(TEMP_WAIT_AFTER_SPO2)
-        print("\\n=== Temperature (parallel) ===")
-        leds.set_gluc_active(True)
-        try:
-            return await temp_sensor.read_average()
-        finally:
-            leds.set_gluc_active(False)
-
     bp_task = asyncio.create_task(bp_coro)
     spo2_task = asyncio.create_task(spo2_coro)
-    temp_task = asyncio.create_task(_run_temp())
 
-    temp_result = None
-    pending = {bp_task, spo2_task, temp_task}
-
+    pending = {bp_task, spo2_task}
     while pending:
-        done_now, pending = await asyncio.wait(
-            pending, return_when=asyncio.FIRST_COMPLETED
-        )
+        done_now, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
 
         for task in done_now:
             try:
                 result = task.result()
-            except Exception as exc:
-                print(f"  [Flow] Task raised: {type(exc).__name__}: {exc}")
+            except Exception:
                 result = None
 
             if task is bp_task:
                 bp_result = result
                 if bp_result:
-                    print("  [Flow] BP done — partial push")
-                    await push_partial(
-                        record_base, bp=bp_result, spo2=spo2_result,
-                        temp=temp_result, partial=True
-                    )
-                else:
-                    print("  [Flow] BP produced no result.")
-
+                    await push_partial(record_base, bp=bp_result, spo2=spo2_result, temp=None, partial=True)
             elif task is spo2_task:
                 spo2_result = result
                 if spo2_result:
-                    print("  [Flow] SpO2 done — partial push")
-                    await push_partial(
-                        record_base, bp=bp_result, spo2=spo2_result,
-                        temp=temp_result, partial=True
-                    )
-                else:
-                    print("  [Flow] SpO2 produced no result.")
+                    await push_partial(record_base, bp=bp_result, spo2=spo2_result, temp=None, partial=True)
 
-            elif task is temp_task:
-                temp_result = result
-                if temp_result:
-                    print("  [Flow] Temp done — partial push")
-                    await push_partial(
-                        record_base, bp=bp_result, spo2=spo2_result,
-                        temp=temp_result, partial=True
-                    )
-                else:
-                    print("  [Flow] Temp produced no result.")
+    print("\n=== Temperature ===")
+    temp_result = await temp_sensor.read_average()
+
+    if temp_result:
+        await push_partial(record_base, bp=bp_result, spo2=spo2_result, temp=temp_result, partial=True)
 
     print("\n=== Camera ===")
-
-    camera_task = asyncio.create_task(record_video(patient_num, leds))
-    await camera_task
+    await record_video(patient_num, leds)
 
     print("\n=== Final Push ===")
     record_final = {
@@ -1323,7 +1160,6 @@ async def run_patient_capture(patient_num, bp_dev, spo2_dev, temp_sensor, leds):
         "spo2": spo2_result if spo2_result else NULL_SPO2,
         "temp": temp_result if temp_result else NULL_TEMP,
     }
-    print("\n=== RECORD ===")
     print(json.dumps(record_final, indent=2))
     pushed_ok = await push_partial(
         record_base, bp=bp_result, spo2=spo2_result,
@@ -1337,19 +1173,14 @@ async def run_patient_capture(patient_num, bp_dev, spo2_dev, temp_sensor, leds):
     )
 
     leds.set_state(LEDState.POST_FLOW)
-    print(f"\n  [Lockout] Post-flow lockout for up to {LOCKOUT_SECS}s (or until clearvitals signal). BP light resumes after.")
-
     skip_event = asyncio.Event()
     poll_task = asyncio.create_task(poll_for_clearvitals(skip_event))
     lockout_task = asyncio.create_task(asyncio.sleep(LOCKOUT_SECS))
 
-    done, pending = await asyncio.wait([poll_task, lockout_task], return_when=asyncio.FIRST_COMPLETED)
-    for t in pending:
-        t.cancel()
-        try:
-            await t
-        except asyncio.CancelledError:
-            pass
+    await asyncio.wait([poll_task, lockout_task], return_when=asyncio.FIRST_COMPLETED)
+    for t in (poll_task, lockout_task):
+        if not t.done():
+            t.cancel()
 
     leds.set_state(LEDState.WAIT_BP)
     log_session_divider()
@@ -1361,14 +1192,15 @@ async def run_patient_capture(patient_num, bp_dev, spo2_dev, temp_sensor, leds):
 
 async def main():
     leds = LEDController()
-    temp_sensor = TempSensor()
+    temp_sensor = TempSensor(leds=leds)
     patient_num = 0
 
     led_task = asyncio.create_task(leds.run())
     leds.set_state(LEDState.WAIT_BP)
 
     print("\n" + "=" * 60)
-    print("  O-Health Vitals Kiosk — rpi23")
+    print("  O-Health Vitals Kiosk — rpi28")
+    print("  [build] spo2-btctl v3 active")
     print("=" * 60)
 
     await drain_spool()
@@ -1380,7 +1212,7 @@ async def main():
             patient_num += 1
             await run_patient_capture(patient_num, bp_dev, spo2_dev, temp_sensor, leds)
     except KeyboardInterrupt:
-        print("\n  Shutdown requested.")
+        print("\n  Shut Down")
     finally:
         leds.shutdown()
         led_task.cancel()
@@ -1389,7 +1221,6 @@ async def main():
         except asyncio.CancelledError:
             pass
         _console_log_fh.close()
-        _downloads_log_fh.close()
         print("  Goodbye.")
 
 if __name__ == "__main__":
